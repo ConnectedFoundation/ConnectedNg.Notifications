@@ -4,6 +4,11 @@ import { SubscriptionService } from './subscription-service';
 
 export type PushPermission = NotificationPermission | 'unsupported';
 
+// One consuming app's push copy, by the key a push payload names. The worker has no localization of
+// its own - it shows whatever it is given - so this is already resolved to the reader's language
+// before it reaches here.
+export type PushMessageMap = Record<string, { title: string; body: string }>;
+
 // Resolved against the document base URL, so the worker's scope is the application root.
 const SERVICE_WORKER_URL = 'push-service-worker.js';
 
@@ -62,6 +67,22 @@ export class PushNotificationService {
     }));
 
     return true;
+  }
+
+  // Sends the caller's locale-resolved push copy to the worker so a later push, which carries only a
+  // key, can be shown in this instance's language. Safe to call on every app load regardless of
+  // subscription state: the worker only reads the map once a push arrives, and re-sending the same
+  // content on each load is how a later deployment's changed wording reaches an already-subscribed
+  // device, which never re-runs subscribe().
+  async syncMessages(messages: PushMessageMap): Promise<void> {
+    if (!this.isSupported())
+      return;
+
+    await navigator.serviceWorker.register(SERVICE_WORKER_URL);
+
+    const registration = await navigator.serviceWorker.ready;
+
+    registration.active?.postMessage({ type: 'push-messages', messages });
   }
 
   async unsubscribe(): Promise<void> {
