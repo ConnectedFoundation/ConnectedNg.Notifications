@@ -74,7 +74,12 @@ export class PushNotificationService {
   // subscription state: the worker only reads the map once a push arrives, and re-sending the same
   // content on each load is how a later deployment's changed wording reaches an already-subscribed
   // device, which never re-runs subscribe().
-  async syncMessages(messages: PushMessageMap): Promise<void> {
+  //
+  // locale travels the same way, for the same reason: this app is deployed as one separate build per
+  // locale, served under a /{locale} path segment, and a backend sending a bare path like "/clarity"
+  // has no locale of its own to put in front of it - a broadcast reaches devices in every locale at
+  // once. Only the device that is about to open the link knows which one it's currently running.
+  async syncMessages(messages: PushMessageMap, locale: string): Promise<void> {
     if (!this.isSupported())
       return;
 
@@ -82,7 +87,7 @@ export class PushNotificationService {
 
     const registration = await navigator.serviceWorker.ready;
 
-    registration.active?.postMessage({ type: 'push-messages', messages });
+    registration.active?.postMessage({ type: 'push-messages', messages, locale });
   }
 
   async unsubscribe(): Promise<void> {

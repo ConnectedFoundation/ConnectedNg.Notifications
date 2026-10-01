@@ -3,6 +3,8 @@
 const MESSAGES_CACHE = "connected-ng-notifications";
 const MESSAGES_URL = "/push-messages";
 
+const DEFAULT_LOCALE = "en-US";
+
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
@@ -11,13 +13,15 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-// The app posts its current locale's { key: { title, body } } map on every load (see
-// PushNotificationService.syncMessages), since this worker has no localization of its own and cannot
-// compile $localize text itself.
+// The app posts its current locale's { key: { title, body } } map, and the locale itself, on every
+// load (see PushNotificationService.syncMessages). The map exists because this worker cannot compile
+// $localize text of its own; the locale exists because this app is one separate build per locale
+// served under a /{locale} path, and a bare path like the backend sends has no locale segment to its
+// own name - only this device's last app load knows which one belongs in front of it.
 self.addEventListener("message", (event) => {
   if (event.data?.type !== "push-messages") return;
 
-  event.waitUntil(saveMessages(event.data.messages ?? {}));
+  event.waitUntil(saveState(event.data.messages ?? {}, event.data.locale));
 });
 
 self.addEventListener("push", (event) => {
@@ -29,8 +33,8 @@ self.addEventListener("push", (event) => {
 });
 
 async function showFromPayload(payload) {
-  const messages = payload.key ? await loadMessages() : {};
-  const text = messages[payload.key];
+  const { messages } = await loadState();
+  const text = payload.key ? messages[payload.key] : undefined;
 
   // Falls back to the payload's own text - the sender's English default - when no saved map has this
   // key, which is also what happens on a device that received a push before ever loading the app.
@@ -49,8 +53,16 @@ self.addEventListener("notificationclick", (event) => {
 
   if (!url) return;
 
-  event.waitUntil(focusOrOpen(new URL(url, self.registration.scope).href));
+  event.waitUntil(openLocalized(url));
 });
+
+async function openLocalized(path) {
+  const { locale } = await loadState();
+
+  return focusOrOpen(
+    new URL(`/${locale}${path}`, self.registration.scope).href,
+  );
+}
 
 async function focusOrOpen(url) {
   const windows = await self.clients.matchAll({
@@ -59,31 +71,44 @@ async function focusOrOpen(url) {
   });
 
   for (const client of windows) {
-    if (client.url === url && "focus" in client) return client.focus();
+    if (!("focus" in client)) continue;
+
+    if ("navigate" in client) {
+      try {
+        await client.navigate(url);
+      } catch {
+        // Cross-origin or unsupported in this browser - focusing the tab as-is still beats nothing.
+      }
+    }
+
+    return client.focus();
   }
 
-  try {
-    return await self.clients.openWindow(url);
-  } catch (error) {
-    console.error("[push-service-worker] openWindow failed", error);
-    throw error;
-  }
+  if (self.clients.openWindow) return self.clients.openWindow(url);
 }
 
 // A plain variable would not survive the worker being terminated between events, which happens
-// routinely between an app load posting a map and a later push arriving. The Cache API persists
-// across that the same as IndexedDB would, for one small JSON value with none of IndexedDB's
+// routinely between an app load posting this and a later push or click arriving. The Cache API
+// persists across that the same as IndexedDB would, for one small JSON value with none of IndexedDB's
 // transaction/object-store ceremony - a synthetic request/response pair is all this needs.
-async function saveMessages(messages) {
+async function saveState(messages, locale) {
   const cache = await caches.open(MESSAGES_CACHE);
 
-  await cache.put(MESSAGES_URL, new Response(JSON.stringify(messages)));
+  await cache.put(
+    MESSAGES_URL,
+    new Response(
+      JSON.stringify({ messages, locale: locale || DEFAULT_LOCALE }),
+    ),
+  );
 }
 
-async function loadMessages() {
+async function loadState() {
   const cache = await caches.open(MESSAGES_CACHE);
   const response = await cache.match(MESSAGES_URL);
 
-  // No map saved yet - the caller falls back to the payload's own text.
-  return response ? await response.json() : {};
+  // Nothing saved yet - a push arriving, or a notification opened, before any app load ever reached
+  // this device. Falls back to the sender's own text and the default locale respectively.
+  return response
+    ? await response.json()
+    : { messages: {}, locale: DEFAULT_LOCALE };
 }
