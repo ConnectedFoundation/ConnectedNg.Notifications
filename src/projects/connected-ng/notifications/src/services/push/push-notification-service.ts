@@ -15,12 +15,14 @@ export type PushPermission = NotificationPermission | 'unsupported';
 // - failed: allowed, but registering did not work. Retried on every app load and when back online
 export type PushStatus = 'unsupported' | 'not-asked' | 'not-allowed' | 'checking' | 'on' | 'failed';
 
-// Absolute image URLs the worker shows with every notification. Without an icon, Chrome on Android
-// draws the site's first letter instead. A badge must be a monochrome image on a transparent
-// background, because Android shows only its silhouette.
-export interface PushAppearance {
+// What the app tells the worker about itself. Without an icon, Chrome on Android draws the site's first
+// letter instead. A badge must be a monochrome image on a transparent background, because Android shows
+// only its silhouette. The locales are every locale the app is built for: the worker only treats a first
+// path segment as a locale when it is in this list, so a window on /app is never mistaken for one.
+export interface PushWorkerSettings {
   icon?: string;
   badge?: string;
+  locales?: readonly string[];
 }
 
 // Resolved against the document base URL, so the worker's scope is the application root.
@@ -34,6 +36,11 @@ const ASKED_KEY = 'connected-ng-notifications:asked';
 const LOCK_NAME = 'connected-ng-notifications';
 
 const DETACH_TIMEOUT_MS = 2000;
+
+// How long a registration the server confirmed is trusted. Registering is an upsert that changes nothing
+// when nothing changed, so repeating it now and then brings back a row removed on the server (a database
+// restore, another person taking the device over and giving it back) without waiting for a reload.
+const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 
 @Injectable({
   providedIn: 'root',
@@ -57,8 +64,8 @@ export class PushNotificationService {
   private registration: Promise<ServiceWorkerRegistration> | null = null;
   private publicKey: Uint8Array<ArrayBuffer> | null = null;
 
-  // The endpoint the server confirmed during this app session. Saves a round trip on every focus.
-  private confirmedEndpoint: string | null = null;
+  // The endpoint the server confirmed, and when. Saves a round trip on every focus, but only for a while.
+  private confirmed: { endpoint: string; at: number } | null = null;
 
   private cancelPendingAsk: (() => void) | null = null;
 
@@ -66,7 +73,7 @@ export class PushNotificationService {
   private asking = false;
 
   // The message type keeps its old name so a worker installed before this change still understands it.
-  private lastSync: { type: 'push-messages'; locale: string; icon?: string; badge?: string } | null = null;
+  private lastSync: { type: 'push-messages'; locale: string; locales?: readonly string[]; icon?: string; badge?: string } | null = null;
 
   constructor() {
     if (this.isSupported())
@@ -104,16 +111,16 @@ export class PushNotificationService {
 
   suspend(): void {
     this.active = false;
-    this.confirmedEndpoint = null;
+    this.confirmed = null;
     this.cancelPendingAsk?.();
   }
 
   // Tells the worker which interface language this build runs in and which images to show
-  async syncWorker(locale: string, appearance: PushAppearance = {}): Promise<void> {
+  async syncWorker(locale: string, settings: PushWorkerSettings = {}): Promise<void> {
     if (!this.isSupported())
       return;
 
-    this.lastSync = { type: 'push-messages', locale, icon: appearance.icon, badge: appearance.badge };
+    this.lastSync = { type: 'push-messages', locale, locales: settings.locales, icon: settings.icon, badge: settings.badge };
 
     await this.post(await this.registerWorker());
   }
@@ -157,7 +164,7 @@ export class PushNotificationService {
 
     if (permission === 'denied' || (permission === 'default' && this.wasAsked())) {
       this._status.set('not-allowed');
-      this.confirmedEndpoint = null;
+      this.confirmed = null;
 
       await this.forgetAll();
 
@@ -194,20 +201,24 @@ export class PushNotificationService {
       if (!this.active)
         return;
 
-      if (subscription.endpoint !== this.confirmedEndpoint) {
+      if (!this.isConfirmed(subscription)) {
         await this.register(subscription);
         await this.ensurePreference();
 
-        this.confirmedEndpoint = subscription.endpoint;
+        this.confirmed = { endpoint: subscription.endpoint, at: Date.now() };
       }
 
       this._status.set('on');
     } catch (error) {
       console.error('Push notifications could not be set up on this device', error);
 
-      this.confirmedEndpoint = null;
+      this.confirmed = null;
       this._status.set('failed');
     }
+  }
+
+  private isConfirmed(subscription: PushSubscription): boolean {
+    return this.confirmed?.endpoint === subscription.endpoint && Date.now() - this.confirmed.at < CONFIRMATION_TTL_MS;
   }
 
   // The browser's own question, at most once per device
@@ -264,24 +275,16 @@ export class PushNotificationService {
     await this.reconcile();
   }
 
-  // Registers with the server. An upsert on the server, so a repeat changes nothing and a new person
-  // signing in on this device takes it over.
+  // Registers with the server. Needs the server's upsert: a repeat changes nothing and a new person
+  // signing in on this device takes it over. A failure is reported as it is, and retried by the next
+  // check, instead of being answered with a delete that could leave the device unregistered.
   private async register(subscription: PushSubscription): Promise<void> {
     const keys = subscription.toJSON().keys;
 
     if (!keys?.['p256dh'] || !keys?.['auth'])
       throw new Error('The browser returned a push subscription without encryption keys.');
 
-    const dto = { endpoint: subscription.endpoint, p256dh: keys['p256dh'], auth: keys['auth'] };
-
-    try {
-      await firstValueFrom(this.subscriptions.insert(dto));
-    } catch {
-      // A server from before the upsert refuses an endpoint it already has. Delete and insert again, the
-      // way it was registered before, so a mixed rollout still works.
-      await firstValueFrom(this.subscriptions.delete({ endpoint: subscription.endpoint }));
-      await firstValueFrom(this.subscriptions.insert(dto));
-    }
+    await firstValueFrom(this.subscriptions.insert({ endpoint: subscription.endpoint, p256dh: keys['p256dh'], auth: keys['auth'] }));
   }
 
   private async ensurePreference(): Promise<void> {
@@ -388,7 +391,7 @@ export class PushNotificationService {
 
     navigator.serviceWorker.addEventListener('message', (event: MessageEvent) => {
       if (event.data?.type === 'push-subscription-changed') {
-        this.confirmedEndpoint = null;
+        this.confirmed = null;
         this.refresh();
       }
 
