@@ -21,7 +21,7 @@ export class SubscriptionService extends ConnectedServiceBase {
     return this.configuration.baseUrl();
   }
 
-  // registers this browser for the signed-in user. Resolves to the new subscription's id
+  // registers this browser for the signed-in user, taking the endpoint over if another user had it. Safe to repeat
   readonly insert = this.createPostOperation<InsertSubscriptionDto, number>('insert');
 
   // removes the signed-in user's subscription for a browser endpoint
